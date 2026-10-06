@@ -36,12 +36,21 @@ APP_TITLE = "Python 压力测试器（图形界面）"
 POLL_MS = 60                 # 主线程多久去队列里取一次新日志
 MAX_LOG_LINES = 4000         # 日志区最多留多少行，超出就从头删
 DRAIN_WAIT_SECONDS = 2.0     # 进程结束后，最多再等这么久把剩余输出收干净
-MATCH_FAIL_FILES = "fail_*.txt"
 
-# main.py 结尾那行：通过 151 组 / 崩 47 组 / 超时 2 组
-STATS_RE = re.compile(r"^通过\s+(\d+)\s+组\s*/\s*崩\s+(\d+)\s+组\s*/\s*超时\s+(\d+)\s+组\s*$")
+# 三类失败文件：崩溃、对拍不一致、参考程序自身出错
+FAIL_PATTERNS = ("fail_*.txt", "diff_*.txt", "ref_fail_*.txt")
+
+# main.py 结尾那行（给了 --ref 会多一段「/ 不一致 k 组」）：
+#   通过 151 组 / 崩 47 组 / 超时 2 组
+#   通过 151 组 / 崩 47 组 / 超时 2 组 / 不一致 3 组
+STATS_RE = re.compile(
+    r"^通过\s+(\d+)\s+组\s*/\s*崩\s+(\d+)\s+组\s*/\s*超时\s+(\d+)\s+组"
+    r"(?:\s*/\s*不一致\s+(\d+)\s+组)?\s*$"
+)
+# 参考程序出错时，统计行下面会补一句
+REF_NOTE_RE = re.compile(r"^参考程序自身出错\s+(\d+)\s+组")
 # main.py 每组一行： [   4/200] 崩溃    0.064s  返回码=1  ZeroDivisionError: ...
-PROGRESS_RE = re.compile(r"^\[\s*(\d+)\s*/\s*(\d+)\s*\]\s*(通过|崩溃|超时)")
+PROGRESS_RE = re.compile(r"^\[\s*(\d+)\s*/\s*(\d+)\s*\]\s*(通过|崩溃|超时|不一致|参考程序出错)")
 
 MONO_FONT = ("Consolas", 10)
 UI_FONT = ("Microsoft YaHei UI", 10)
@@ -181,6 +190,21 @@ def open_with_system(path: Path) -> None:
         subprocess.run(["xdg-open", str(path)], check=False)
 
 
+def reveal_in_folder(path: Path) -> None:
+    """打开文件所在的文件夹，并把这个文件选中。"""
+    if os.name == "nt":
+        # explorer 的返回码不可靠：成功也可能返回非 0，所以这里只负责把它启动起来，
+        # 绝不拿返回码判断成败（启动不了会直接抛 OSError）。
+        # 注意要传一整个字符串，让命令行原样变成： explorer /select,"C:\...\fail_1.txt"
+        subprocess.Popen('explorer /select,"{}"'.format(path))
+        return
+    folder = path if path.is_dir() else path.parent
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", str(folder)])
+    else:
+        subprocess.Popen(["xdg-open", str(folder)])
+
+
 # --------------------------------------------------------------------------- #
 # 界面
 # --------------------------------------------------------------------------- #
@@ -198,6 +222,8 @@ class StressApp:
         self.log_line_count = 0
         self.current_fails: list[Path | None] = []
         self.stats_text = ""
+        self.ref_note = ""                          # 「参考程序自身出错 …」那一句
+        self.last_counts = (0, 0, 0, 0)             # 通过 / 崩 / 超时 / 不一致
         self.last_opened_path: Path | None = None   # 防重复打开，见 open_selected_fail
         self.last_opened_at = 0.0
 
@@ -205,6 +231,7 @@ class StressApp:
         self.outdir = resolve_outdir(self.workdir)
 
         self.target_var = tk.StringVar()
+        self.ref_var = tk.StringVar()                 # 参考程序，留空＝只做压力测试
         self.python_var = tk.StringVar(value=find_python_interpreter())
         self.count_var = tk.StringVar(value="200")
         self.timeout_var = tk.StringVar(value="1.0")
@@ -258,16 +285,24 @@ class StressApp:
         ttk.Entry(box, textvariable=self.target_var).grid(row=0, column=1, sticky="ew", padx=(0, 8))
         ttk.Button(box, text="选择被测试程序…", command=self.choose_target).grid(row=0, column=2)
 
+        # 参考程序（对拍用，可以留空）
+        ttk.Label(box, text="参考程序：").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(box, textvariable=self.ref_var).grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(6, 0))
+        ttk.Button(box, text="选择…", command=self.choose_ref).grid(row=1, column=2, pady=(6, 0))
+        ttk.Label(box, text="留空＝只做压力测试（只看崩没崩、超没超时）；"
+                            "填了就顺便对拍，比两个程序的输出",
+                  foreground="#666666").grid(row=2, column=1, sticky="w", pady=(0, 4))
+
         # 解释器
-        ttk.Label(box, text="Python 解释器：").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(box, textvariable=self.python_var).grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(6, 0))
-        ttk.Button(box, text="浏览…", command=self.choose_python).grid(row=1, column=2, pady=(6, 0))
+        ttk.Label(box, text="Python 解释器：").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(box, textvariable=self.python_var).grid(row=3, column=1, sticky="ew", padx=(0, 8), pady=(6, 0))
+        ttk.Button(box, text="浏览…", command=self.choose_python).grid(row=3, column=2, pady=(6, 0))
         ttk.Label(box, text="（用它启动 main.py）", foreground="#666666").grid(
-            row=2, column=1, sticky="w", pady=(0, 4))
+            row=4, column=1, sticky="w", pady=(0, 4))
 
         # 三个参数
         params = ttk.Frame(box)
-        params.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        params.grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Label(params, text="测试组数：").grid(row=0, column=0, sticky="w")
         ttk.Entry(params, textvariable=self.count_var, width=8).grid(row=0, column=1, padx=(0, 16))
         ttk.Label(params, text="超时秒数：").grid(row=0, column=2, sticky="w")
@@ -279,11 +314,11 @@ class StressApp:
 
         # 输出目录
         out = ttk.Frame(box)
-        out.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        out.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         out.columnconfigure(1, weight=1)
         ttk.Label(out, text="失败数据目录：").grid(row=0, column=0, sticky="w")
         ttk.Label(out, textvariable=self.outdir_var, foreground="#333333").grid(row=0, column=1, sticky="w")
-        ttk.Button(out, text="打开目录", command=lambda: self.open_path(self.outdir)).grid(row=0, column=2)
+        ttk.Button(out, text="打开目录", command=lambda: self.open_folder(self.outdir)).grid(row=0, column=2)
 
     def _build_controls(self, parent: ttk.Frame, row: int) -> None:
         bar = ttk.Frame(parent)
@@ -300,7 +335,7 @@ class StressApp:
 
     def _build_stats(self, parent: ttk.Frame, row: int) -> None:
         self.stats_label = tk.Label(
-            parent, text="还没开始跑", font=BIG_FONT,
+            parent, text="还没开始跑", font=BIG_FONT, justify="center",
             bg="#eeeeee", fg="#555555", padx=12, pady=8, anchor="center",
         )
         self.stats_label.grid(row=row, column=0, sticky="ew", pady=(2, 8))
@@ -349,12 +384,13 @@ class StressApp:
         self.log_text.tag_config("stat", foreground="#00429d", font=("Consolas", 10, "bold"))
         self.log_text.tag_config("error", foreground="#c00000", font=("Consolas", 10, "bold"))
         self.log_text.tag_config("dim", foreground="#777777")
+        self.log_text.tag_config("warn", foreground="#7a3fa8")
 
         paned.add(left, weight=3)
         paned.add(right, weight=4)
 
     def _build_fail_list(self, parent: ttk.Frame, row: int) -> None:
-        box = ttk.LabelFrame(parent, text=" 失败用例（点一下用系统默认程序打开） ", padding=8)
+        box = ttk.LabelFrame(parent, text=" 失败用例（点一下在文件夹里定位到它） ", padding=8)
         box.grid(row=row, column=0, sticky="ew", pady=(8, 0))
         box.columnconfigure(0, weight=1)
 
@@ -396,9 +432,12 @@ class StressApp:
     def _tag_for(line: str) -> str | None:
         if PROGRESS_RE.match(line):
             status = PROGRESS_RE.match(line).group(3)          # type: ignore[union-attr]
-            return {"通过": "pass", "崩溃": "crash", "超时": "timeout"}.get(status)
+            return {"通过": "pass", "崩溃": "crash", "超时": "timeout",
+                    "不一致": "crash", "参考程序出错": "warn"}.get(status)
         if STATS_RE.match(line):
             return "stat"
+        if REF_NOTE_RE.match(line):
+            return "warn"
         if line.startswith("错误：") or line.startswith("警告："):
             return "error"
         if "-> 已保存" in line:
@@ -468,6 +507,16 @@ class StressApp:
         if path:
             self.target_var.set(path)
 
+    def choose_ref(self) -> None:
+        initial = Path(self.ref_var.get()).parent if self.ref_var.get() else self.workdir
+        path = filedialog.askopenfilename(
+            title="选择参考程序（对拍用，可以留空）",
+            initialdir=str(initial),
+            filetypes=[("Python 文件", "*.py"), ("所有文件", "*.*")],
+        )
+        if path:
+            self.ref_var.set(path)
+
     def choose_python(self) -> None:
         path = filedialog.askopenfilename(
             title="选择 Python 解释器",
@@ -478,15 +527,37 @@ class StressApp:
             self.python_var.set(path)
 
     def open_path(self, path: Path) -> None:
+        """在文件管理器里打开它所在的文件夹并选中它。
+
+        耗时动作（explorer 冷启动可能几百毫秒）放后台线程，界面不卡。
+        explorer 的返回码不可靠，所以只捕获"根本没启动起来"这种情况，
+        真失败了再退回友好提示（由主线程弹，见 _show_open_error）。
+        """
+        threading.Thread(target=self._reveal_worker, args=(path,), daemon=True).start()
+
+    def open_folder(self, path: Path) -> None:
+        """打开一个目录（同样放后台线程）。"""
+        threading.Thread(target=self._open_folder_worker, args=(path,), daemon=True).start()
+
+    def _reveal_worker(self, path: Path) -> None:
+        try:
+            reveal_in_folder(path)
+        except Exception:
+            self.queue.put(("open_error", str(path)))
+
+    def _open_folder_worker(self, path: Path) -> None:
         try:
             open_with_system(path)
         except Exception:
-            # 不把 "[WinError 5] 拒绝访问" 这种原文甩给用户，换成能照着做的提示
-            messagebox.showerror(
-                "打不开这个文件",
-                "打不开这个文件，可能是被安全软件拦截了，请手动用记事本打开。\n\n"
-                "文件位置：\n{}".format(path),
-            )
+            self.queue.put(("open_error", str(path)))
+
+    def _show_open_error(self, path: str) -> None:
+        # 不把 "[WinError 5] 拒绝访问" 这种原文甩给用户，换成能照着做的提示
+        messagebox.showerror(
+            "打不开这个文件",
+            "打不开这个文件，可能是被安全软件拦截了，请手动用记事本打开。\n\n"
+            "文件位置：\n{}".format(path),
+        )
 
     # ------------------------------------------------------------------ #
     # 失败用例列表
@@ -496,17 +567,17 @@ class StressApp:
         self.current_fails = []
 
         entries: list[Path] = []
-        for index in range(1, 6):
-            path = self.outdir / f"fail_{index}.txt"
-            if not path.is_file():
-                continue
-            # 只列这次运行产生的（run_started_at 为 0 时表示还没跑过，列出已有的）
-            if self.run_started_at and path.stat().st_mtime < self.run_started_at - 5:
-                continue
-            entries.append(path)
+        for pattern in FAIL_PATTERNS:                 # fail_* / diff_* / ref_fail_*
+            for path in sorted(self.outdir.glob(pattern)):
+                if not path.is_file():
+                    continue
+                # 只列这次运行产生的（run_started_at 为 0 时表示还没跑过，列出已有的）
+                if self.run_started_at and path.stat().st_mtime < self.run_started_at - 5:
+                    continue
+                entries.append(path)
 
         if not entries:
-            self.fail_list.insert("end", "（这次没有产生 fail_*.txt）")
+            self.fail_list.insert("end", "（这次没有产生 fail_*.txt / diff_*.txt / ref_fail_*.txt）")
             self.fail_list.itemconfigure(0, foreground="#888888")
             self.current_fails = [None]
             return
@@ -516,10 +587,16 @@ class StressApp:
         for path in entries:
             try:
                 size = path.stat().st_size
+                stamp = time.strftime("%H:%M:%S", time.localtime(path.stat().st_mtime))
             except OSError:
-                size = 0
-            stamp = time.strftime("%H:%M:%S", time.localtime(path.stat().st_mtime))
-            self.fail_list.insert("end", f"{path.name}    {size} 字节    {stamp}    {path}")
+                size, stamp = 0, "--:--:--"
+            if path.name.startswith("ref_fail_"):
+                kind = "参考程序出错"
+            elif path.name.startswith("diff_"):
+                kind = "答案不一致"
+            else:
+                kind = "崩溃"
+            self.fail_list.insert("end", f"[{kind}] {path.name}    {size} 字节    {stamp}    {path}")
 
     def open_selected_fail(self, _event=None) -> str | None:
         selection = self.fail_list.curselection()
@@ -555,7 +632,7 @@ class StressApp:
                             "可以在左边写一份再点「保存 gen.py」。", "error")
 
     def _read_form(self):
-        """检查界面上的输入，返回 (target, python, count, timeout, seed) 或 None。"""
+        """检查界面上的输入，返回 (target, python, count, timeout, seed, ref) 或 None。"""
         target = self.target_var.get().strip().strip('"')
         if not target:
             messagebox.showwarning("还没有选程序", "请先点「选择被测试程序…」挑一个 .py 文件。")
@@ -567,6 +644,18 @@ class StressApp:
         if target_path.suffix.lower() != ".py":
             messagebox.showwarning("文件类型不对", "被测试程序必须是一个 .py 文件。")
             return None
+
+        # 参考程序可以留空；填了就必须是个存在的 .py
+        ref_text = self.ref_var.get().strip().strip('"')
+        ref_path: Path | None = None
+        if ref_text:
+            ref_path = Path(ref_text)
+            if not ref_path.is_file():
+                messagebox.showerror("找不到参考程序", f"没有这个文件：\n{ref_path}")
+                return None
+            if ref_path.suffix.lower() != ".py":
+                messagebox.showwarning("文件类型不对", "参考程序必须是一个 .py 文件。")
+                return None
 
         python_exe = self.python_var.get().strip().strip('"')
         if not python_exe:
@@ -604,7 +693,7 @@ class StressApp:
                 messagebox.showwarning("随机种子不对", "随机种子要么留空，要么填一个整数，例如 123。")
                 return None
 
-        return target_path, python_exe, count, timeout, seed
+        return target_path, python_exe, count, timeout, seed, ref_path
 
     def start(self) -> None:
         if self.running:
@@ -612,7 +701,7 @@ class StressApp:
         form = self._read_form()
         if form is None:
             return
-        target_path, python_exe, count, timeout, seed = form
+        target_path, python_exe, count, timeout, seed, ref_path = form
 
         # 左边编辑器里有改动就先存盘，保证跑的是界面上看到的那份规则
         if self.gen_dirty or not self.gen_py.is_file():
@@ -628,6 +717,8 @@ class StressApp:
         ]
         if seed is not None:
             cmd += ["--seed", str(seed)]
+        if ref_path is not None:
+            cmd += ["--ref", str(ref_path)]
 
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"   # 中文输出统一按 utf-8 读，避免乱码
@@ -745,6 +836,8 @@ class StressApp:
                     self._handle_line(str(payload))
                 elif kind == "exit":
                     self._handle_exit(payload)          # type: ignore[arg-type]
+                elif kind == "open_error":
+                    self._show_open_error(str(payload))
         except queue.Empty:
             pass
         finally:
@@ -752,17 +845,27 @@ class StressApp:
 
     def _handle_line(self, line: str) -> None:
         self.append_log(line)
+
         match = STATS_RE.match(line)
         if match:
-            passed, crashed, timed_out = (int(x) for x in match.groups())
+            passed, crashed, timed_out, mismatch = (int(x) if x else 0 for x in match.groups())
+            self.last_counts = (passed, crashed, timed_out, mismatch)
             self.stats_text = line
-            if crashed == 0 and timed_out == 0:
+            self.ref_note = ""                 # 统计行先到，「参考程序出错」那句跟在后面
+            if crashed == 0 and timed_out == 0 and mismatch == 0:
                 self.set_stats(line, "#e6f7e6", "#0a7d28")
-            elif crashed > 0:
+            elif crashed > 0 or mismatch > 0:
                 self.set_stats(line, "#fdecec", "#b00000")
             else:
                 self.set_stats(line, "#fff4e0", "#8a5a00")
             return
+
+        note = REF_NOTE_RE.match(line)
+        if note:
+            self.ref_note = line.strip()
+            self.set_stats(f"{self.stats_text}\n{self.ref_note}", "#fff4e0", "#8a5a00")
+            return
+
         progress = PROGRESS_RE.match(line)
         if progress:
             self.status_var.set(f"正在运行：第 {progress.group(1)} / {progress.group(2)} 组")
@@ -780,7 +883,11 @@ class StressApp:
         elif code == 0:
             self.status_var.set("完成：全部通过")
         elif code == 1:
-            self.status_var.set("完成：发现了问题，看下面的失败用例")
+            passed, crashed, timed_out, mismatch = self.last_counts
+            if crashed or timed_out or mismatch:
+                self.status_var.set("完成：发现了问题，看下面的失败用例")
+            else:
+                self.status_var.set("完成：参考程序自身出错，请先修参考程序")
         elif code == 2:
             self.status_var.set("出错了：用法或环境问题（看日志里的「错误：」）")
         else:

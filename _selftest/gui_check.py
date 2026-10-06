@@ -113,6 +113,8 @@ def run_checks():
     check("界面：开始/停止按钮都在", hasattr(application, "start_btn") and hasattr(application, "stop_btn"))
     check("界面：日志区、gen 编辑器、失败列表都在",
           all(hasattr(application, n) for n in ("log_text", "gen_text", "fail_list", "stats_label")))
+    check("界面：有「参考程序」输入框（对拍用）",
+          hasattr(application, "ref_var") and application.ref_var.get() == "")
     check("界面：main.py 找对了", application.main_py.name == "main.py" and application.main_py.is_file(),
           str(application.main_py))
     check("界面：初始状态是空闲，停止按钮不可点",
@@ -223,20 +225,24 @@ def run_checks():
     application.open_selected_fail()
     check("失败用例：没有文件时点占位行不会报错、也不会打开东西", not opened)
 
-    # 打开失败时给的提示必须是"人话"，并且带完整路径
+    # 打开失败时给的提示必须是"人话"，并且带完整路径（打开动作在后台线程里做）
     def boom(_p):
         raise OSError("[WinError 5] 拒绝访问")
 
     errs = []
     app_module.messagebox.showerror = lambda *a, **k: errs.append(a)
-    original_open_with_system = app_module.open_with_system
-    app_module.open_with_system = boom
+    original_reveal = app_module.reveal_in_folder
+    app_module.reveal_in_folder = boom
     miss = ROOT / "_selftest" / "根本不存在_fail_1.txt"
     try:
-        app_module.StressApp.open_path(application, miss)     # 调真实的 open_path
+        t0 = time.time()
+        app_module.StressApp.open_path(application, miss)     # 调真实的 open_path（后台线程）
+        immediate = time.time() - t0
+        pump(root, 5, until=lambda: bool(errs))               # 等后台线程把错误抛回主线程
     finally:
-        app_module.open_with_system = original_open_with_system
+        app_module.reveal_in_folder = original_reveal
     text = " ".join(str(x) for x in errs[-1]) if errs else ""
+    check("打开失败：open_path 立刻返回，不等后台线程", immediate < 0.2, f"{immediate:.3f}s")
     check("打开失败：提示是人话、带完整路径、不甩系统报错原文",
           bool(errs) and "安全软件" in text and "记事本" in text
           and str(miss) in text and "WinError" not in text,
@@ -309,7 +315,75 @@ def run_checks():
     else:
         skip("停止：被测试进程也一起被结束了", "没拿到被测试进程 pid")
 
-    # ---- 7. 关窗 ----------------------------------------------------------- #
+    # ---- 7. 对拍（--ref）：界面填参考程序、统计条新格式、列表分三类 ---------- #
+    ref_diff = WORK / "ref_diff.py"
+    ref_diff.write_text(
+        "import sys\nsys.stdin.read()\n"
+        "print('sum = 0')\nprint('average = 0')\nprint('max/min = 0')\n",
+        encoding="utf-8")
+    ref_crash = WORK / "ref_crash.py"
+    ref_crash.write_text("import sys\nsys.stdin.read()\nraise SystemExit(5)\n", encoding="utf-8")
+
+    out_ref = OUT / "ref"
+    if out_ref.exists():
+        shutil.rmtree(out_ref)
+    out_ref.mkdir(parents=True)
+    application.target_var.set(str(target))
+    application.ref_var.set(str(ref_diff))
+    application.count_var.set("12")
+    application.timeout_var.set("1")
+    application.seed_var.set("123")
+    application.outdir = out_ref
+    application.outdir_var.set(str(out_ref))
+    warnings.clear()
+    application.start()
+    pump(root, 90, until=lambda: application.running is False)
+    pump(root, 0.8)
+
+    banner = application.stats_label["text"]
+    check("对拍：统计横条显示了新格式（带「不一致 k 组」）",
+          "/ 不一致" in banner and re.search(r"不一致 \d+ 组", banner) is not None, repr(banner))
+    check("对拍：真实拼进了 --ref 参数",
+          "--ref" in application.log_text.get("1.0", "end"),
+          repr(application.log_text.get("1.0", "end").splitlines()[8] if
+               len(application.log_text.get("1.0", "end").splitlines()) > 8 else ""))
+    kinds = [application.fail_list.get(i) for i in range(application.fail_list.size())]
+    check("对拍：失败列表同时列出「崩溃」和「答案不一致」",
+          any("[崩溃]" in k for k in kinds) and any("[答案不一致]" in k for k in kinds),
+          str(kinds[:3]))
+    diff_index = next((i for i, k in enumerate(kinds) if "[答案不一致]" in k), None)
+    opened.clear()
+    if diff_index is not None:
+        application.fail_list.selection_clear(0, "end")
+        application.fail_list.selection_set(diff_index)
+        application.open_selected_fail()
+    check("对拍：点 diff_*.txt 同样能打开它",
+          len(opened) == 1 and "diff_" in opened[0].name, str(opened))
+
+    # 参考程序自己崩了：统计条下面补一句，且绝不能写 fail_*/diff_*
+    # 这里换一个「永远不崩」的被测试程序，才能干净地看出参考程序的错没算到它头上
+    out_ref2 = OUT / "ref2"
+    if out_ref2.exists():
+        shutil.rmtree(out_ref2)
+    out_ref2.mkdir(parents=True)
+    application.target_var.set(str(ROOT / "templates" / "examples" / "gen_array_target.py"))
+    application.ref_var.set(str(ref_crash))
+    application.outdir = out_ref2
+    application.outdir_var.set(str(out_ref2))
+    application.start()
+    pump(root, 90, until=lambda: application.running is False)
+    pump(root, 0.8)
+    banner2 = application.stats_label["text"]
+    check("对拍：参考程序自己崩了，被测试程序一组都没被判错（崩/不一致都是 0）",
+          "崩 0 组" in banner2 and "不一致 0 组" in banner2, repr(banner2))
+    check("对拍：参考程序自己崩了会单独提示一句",
+          "参考程序自身出错" in banner2, repr(banner2))
+    check("对拍：这种情况不写 fail_*.txt / diff_*.txt，只写 ref_fail_*.txt",
+          not list(out_ref2.glob("fail_*.txt")) and not list(out_ref2.glob("diff_*.txt"))
+          and len(list(out_ref2.glob("ref_fail_*.txt"))) >= 1,
+          str([p.name for p in out_ref2.iterdir()]))
+
+    # ---- 8. 关窗 ----------------------------------------------------------- #
     application.on_close()
     check("关窗：窗口正常销毁", True)
 
