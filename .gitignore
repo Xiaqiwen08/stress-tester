@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+fail_*.txt
+diff_*.txt
+ref_fail_*.txt
