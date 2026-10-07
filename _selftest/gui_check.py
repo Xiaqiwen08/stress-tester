@@ -116,9 +116,10 @@ def run_checks():
     check("界面：有「参考程序」输入框（对拍用）",
           hasattr(application, "ref_var") and application.ref_var.get() == "")
     check("界面：窗口标题带版本号",
-          app_module.APP_VERSION == "0.1.0" and "v0.1.0" in root.title(), repr(root.title()))
+          app_module.APP_VERSION == "0.2.0"
+          and f"v{app_module.APP_VERSION}" in root.title(), repr(root.title()))
     check("界面：日志开头也写了版本号",
-          "v0.1.0" in application.log_text.get("1.0", "end"))
+          f"v{app_module.APP_VERSION}" in application.log_text.get("1.0", "end"))
     check("界面：main.py 找对了", application.main_py.name == "main.py" and application.main_py.is_file(),
           str(application.main_py))
     check("界面：初始状态是空闲，停止按钮不可点",
@@ -478,7 +479,106 @@ def run_checks():
           and len(list(out_ref2.glob("ref_fail_*.txt"))) >= 1,
           str([p.name for p in out_ref2.iterdir()]))
 
-    # ---- 8. 关窗 ----------------------------------------------------------- #
+    # ---- 9. 一键套用 templates/ 里的模板 ----------------------------------- #
+    box = application.template_box
+    values = list(box["values"])
+    check("模板：下拉框是只读的（state=readonly）", str(box["state"]) == "readonly", str(box["state"]))
+    check("模板：第一项固定是「（不使用模板）」",
+          bool(values) and values[0] == "（不使用模板）", str(values[:2]))
+    template_names = [v for v in values if v.endswith(".py")]
+    check("模板：列出了 templates/ 下这一层的 6 个 gen_*.py（不含 examples/）",
+          template_names == ["gen_array.py", "gen_graph.py", "gen_matrix.py",
+                             "gen_multi.py", "gen_query.py", "gen_string.py"],
+          str(template_names))
+    check("模板：找到了 templates 目录并绑好了选择事件",
+          application.templates_dir is not None and len(application.template_paths) == 6
+          and bool(box.bind("<<ComboboxSelected>>")),
+          str(application.templates_dir))
+
+    disk_before_bytes = application.gen_py.read_bytes()
+    disk_before = disk_before_bytes.decode("utf-8")
+    application.load_gen()                      # 从磁盘重新载入，保证起点干净
+
+    application.template_var.set("gen_array.py")
+    application.on_template_selected()
+    array_text = (ROOT / "templates" / "gen_array.py").read_text(encoding="utf-8")
+    check("模板：选 gen_array.py 后编辑区变成它的内容",
+          application.gen_text.get("1.0", "end-1c") == array_text,
+          f"{len(array_text)} 字符")
+    check("模板：套用后标成「还没保存」，但没写盘",
+          application.gen_dirty is True and "还没保存" in application.gen_state_var.get()
+          and application.gen_py.read_text(encoding="utf-8") == disk_before,
+          application.gen_state_var.get())
+
+    # 编辑区有未保存的改动时，再选另一个模板要先弹确认框
+    asked = []
+    real_ask = app_module.messagebox.askyesno
+    app_module.messagebox.askyesno = lambda *a, **k: (asked.append(a), False)[1]
+    application.template_var.set("gen_string.py")
+    application.on_template_selected()
+    check("模板：有未保存改动时会先弹确认框",
+          len(asked) == 1 and "未保存" in str(asked[0]) and "覆盖" in str(asked[0]),
+          str(asked[0]) if asked else "(没弹)")
+    check("模板：点「否」时编辑区不动、下拉框退回「（不使用模板）」",
+          application.gen_text.get("1.0", "end-1c") == array_text
+          and application.template_var.get() == "（不使用模板）",
+          application.template_var.get())
+
+    asked.clear()
+    app_module.messagebox.askyesno = lambda *a, **k: (asked.append(a), True)[1]
+    application.template_var.set("gen_string.py")
+    application.on_template_selected()
+    app_module.messagebox.askyesno = real_ask
+    string_text = (ROOT / "templates" / "gen_string.py").read_text(encoding="utf-8")
+    check("模板：点「是」之后编辑区换成 gen_string.py 的内容",
+          application.gen_text.get("1.0", "end-1c") == string_text and len(asked) == 1)
+
+    # 保存之后要真的能跑
+    out_tpl = OUT / "template"
+    if out_tpl.exists():
+        shutil.rmtree(out_tpl)
+    out_tpl.mkdir(parents=True)
+    check("模板：点「保存 gen.py」把模板写进磁盘",
+          application.save_gen()
+          and application.gen_py.read_text(encoding="utf-8") == string_text
+          and application.gen_dirty is False)
+    application.target_var.set(str(ROOT / "templates" / "examples" / "gen_string_target.py"))
+    application.ref_var.set("")
+    application.count_var.set("3")
+    application.timeout_var.set("1")
+    application.seed_var.set("123")
+    application.outdir = out_tpl
+    application.outdir_var.set(str(out_tpl))
+    warnings.clear()
+    application.start()
+    pump(root, 90, until=lambda: application.running is False)
+    pump(root, 0.5)
+    check("模板：套用+保存之后能正常跑（字符串模板 + 对应示例目标）",
+          application.stats_label["text"] == "通过 3 组 / 崩 0 组 / 超时 0 组",
+          repr(application.stats_label["text"]))
+
+    # 收尾：把 gen.py 还原成进来时的样子（按字节还原，免得顺手改了换行符；外面的 finally 还会再兜一道）
+    application.gen_py.write_bytes(disk_before_bytes)
+    application.load_gen()
+    check("模板：自检收尾把 gen.py 按字节还原了",
+          application.gen_py.read_bytes() == disk_before_bytes)
+
+    # 找不到 templates 目录时：下拉框显示提示并禁用（用假的程序目录触发的真实分支）
+    real_resolve = app_module.resolve_working_files
+    fake_dir = HERE / "假装没有模板的目录"
+    fake_dir.mkdir(parents=True, exist_ok=True)
+    app_module.resolve_working_files = lambda: (fake_dir / "main.py", fake_dir / "gen.py", fake_dir)
+    try:
+        stranded = app_module.StressApp(root)      # 只读它的控件状态，不跑事件循环
+    finally:
+        app_module.resolve_working_files = real_resolve
+    check("模板：找不到 templates 目录时，下拉框显示提示并被禁用",
+          list(stranded.template_box["values"]) == [app_module.NO_TEMPLATES_DIR]
+          and str(stranded.template_box["state"]) == "disabled"
+          and stranded.template_var.get() == app_module.NO_TEMPLATES_DIR,
+          f"{list(stranded.template_box['values'])} / state={stranded.template_box['state']}")
+
+    # ---- 10. 关窗 ---------------------------------------------------------- #
     application.on_close()
     check("关窗：窗口正常销毁", True)
 
@@ -491,15 +591,15 @@ def run_checks():
 
 
 def main():
-    """跑自检，并且无论如何都把 gen.py 还原成运行前的样子（自检不该改交付物）。"""
+    """跑自检，并且无论如何都把 gen.py 按字节还原（自检不该改交付物）。"""
     gen_py = ROOT / "gen.py"
-    original = gen_py.read_text(encoding="utf-8")
+    original = gen_py.read_bytes()
     try:
         return run_checks()
     finally:
-        if gen_py.read_text(encoding="utf-8") != original:
-            gen_py.write_text(original, encoding="utf-8")
-            print("（自检改动了 gen.py，已还原）", flush=True)
+        if gen_py.read_bytes() != original:
+            gen_py.write_bytes(original)
+            print("（自检改动了 gen.py，已按字节还原）", flush=True)
 
 
 if __name__ == "__main__":

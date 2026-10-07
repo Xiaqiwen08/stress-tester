@@ -32,11 +32,16 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 APP_TITLE = f"Python 压力测试器 v{APP_VERSION}（图形界面）"
 POLL_MS = 60                 # 主线程多久去队列里取一次新日志
 MAX_LOG_LINES = 4000         # 日志区最多留多少行，超出就从头删
 DRAIN_WAIT_SECONDS = 2.0     # 进程结束后，最多再等这么久把剩余输出收干净
+
+# 「套用模板」下拉框里的固定项
+NO_TEMPLATE = "（不使用模板）"
+NO_TEMPLATES_DIR = "（没找到 templates 目录）"
+TEMPLATE_GLOB = "gen_*.py"   # 只认 templates/ 目录下这一层的 gen_*.py
 
 # 三类失败文件：崩溃、对拍不一致、参考程序自身出错
 FAIL_PATTERNS = ("fail_*.txt", "diff_*.txt", "ref_fail_*.txt")
@@ -233,6 +238,10 @@ class StressApp:
         self.main_py, self.gen_py, self.workdir = resolve_working_files()
         self.outdir = resolve_outdir(self.workdir)
 
+        # templates/ 里的模板：先找 app.py（或 exe）同目录，再找 main.py 同目录
+        self.templates_dir = self._find_templates_dir()
+        self.template_paths = self._scan_templates(self.templates_dir)
+
         self.target_var = tk.StringVar()
         self.ref_var = tk.StringVar()                 # 参考程序，留空＝只做压力测试
         self.python_var = tk.StringVar(value=find_python_interpreter())
@@ -242,6 +251,8 @@ class StressApp:
         self.outdir_var = tk.StringVar(value=str(self.outdir))
         self.gen_state_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="空闲")
+        self.template_var = tk.StringVar(
+            value=NO_TEMPLATE if self.template_paths else NO_TEMPLATES_DIR)
         self.gen_dirty = False
 
         self._build_ui()
@@ -357,11 +368,26 @@ class StressApp:
 
         toolbar = ttk.Frame(left)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        toolbar.columnconfigure(1, weight=1)
+        toolbar.columnconfigure(4, weight=1)
         ttk.Button(toolbar, text="保存 gen.py", command=self.save_gen).grid(row=0, column=0)
-        ttk.Button(toolbar, text="重新载入", command=self.load_gen).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Button(toolbar, text="重新载入", command=self.load_gen).grid(
+            row=0, column=1, sticky="w", padx=(8, 0))
+
+        # 一键套用 templates/ 里的模板
+        ttk.Label(toolbar, text="套用模板：").grid(row=0, column=2, padx=(16, 4))
+        values = ([NO_TEMPLATE] + [p.name for p in self.template_paths.values()]
+                  if self.template_paths else [NO_TEMPLATES_DIR])
+        self.template_box = ttk.Combobox(toolbar, state="readonly", width=20,
+                                         textvariable=self.template_var, values=values)
+        self.template_box.grid(row=0, column=3, sticky="w")
+        if self.template_paths:
+            self.template_box.bind("<<ComboboxSelected>>", self.on_template_selected)
+        else:
+            # 找不到 templates 目录：显示提示并禁用
+            self.template_box.configure(state="disabled")
+
         ttk.Label(toolbar, textvariable=self.gen_state_var, foreground="#666666").grid(
-            row=0, column=2, sticky="e")
+            row=0, column=5, sticky="e")
 
         text_wrap = ttk.Frame(left)
         text_wrap.grid(row=1, column=0, sticky="nsew")
@@ -500,6 +526,69 @@ class StressApp:
         if self.log_line_count:
             self.append_log(f"（已保存 gen.py：{self.gen_py}）", "dim")
         return True
+
+    # ------------------------------------------------------------------ #
+    # 一键套用 templates/ 里的模板
+    # ------------------------------------------------------------------ #
+    def _find_templates_dir(self) -> Path | None:
+        """按顺序找 templates 目录：先 app.py（或 exe）同目录，再 main.py 同目录。"""
+        for base in (self.workdir, self.main_py.parent):
+            try:
+                candidate = base / "templates"
+                if candidate.is_dir():
+                    return candidate
+            except OSError:
+                continue
+        return None
+
+    @staticmethod
+    def _scan_templates(templates_dir: Path | None) -> dict[str, Path]:
+        """返回 {文件名: 完整路径}。只认 templates 这一层的 gen_*.py（不含 examples/）。"""
+        if templates_dir is None:
+            return {}
+        try:
+            files = sorted((p for p in templates_dir.glob(TEMPLATE_GLOB) if p.is_file()),
+                           key=lambda p: p.name.lower())
+        except OSError:
+            return {}
+        return {p.name: p for p in files}
+
+    def on_template_selected(self, _event=None) -> None:
+        """下拉框选了某个模板：把内容填进编辑区（只填，不写盘）。
+
+        选「（不使用模板）」什么都不做——它就是"没套模板"的默认状态。
+        编辑区有未保存的改动时先问一句，免得手一抖冲掉正在写的规则。
+        """
+        name = self.template_var.get()
+        template = self.template_paths.get(name)
+        if template is None:
+            return
+
+        if self.gen_dirty:
+            ok = messagebox.askyesno(
+                "套用模板",
+                "当前 gen.py 有未保存的改动，套用模板会覆盖它，确定吗？")
+            if not ok:
+                self.template_var.set(NO_TEMPLATE)      # 取消：下拉框回到默认项
+                return
+
+        try:
+            content = template.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            messagebox.showerror(
+                "读不到模板",
+                "读不到这个模板文件，可能是被安全软件拦住了：\n\n{}".format(template))
+            self.template_var.set(NO_TEMPLATE)
+            return
+
+        self.gen_text.configure(state="normal")
+        self.gen_text.delete("1.0", "end")
+        self.gen_text.insert("1.0", content)
+        self.gen_text.edit_modified(False)   # 先把"已修改"标记清掉，下面的状态由我们自己说
+        self.gen_dirty = True                # 只填进编辑区，等用户点「保存 gen.py」才写盘
+        self.gen_state_var.set(f"已套用模板 {template.name}（还没保存）")
+        self.append_log(f"已套用模板 {template.name}，点「保存 gen.py」才会写进 {self.gen_py.name}",
+                        "dim")
 
     # ------------------------------------------------------------------ #
     # 路径选择
