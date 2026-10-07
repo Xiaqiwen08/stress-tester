@@ -32,7 +32,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
-APP_TITLE = "Python 压力测试器（图形界面）"
+APP_VERSION = "0.1.0"
+APP_TITLE = f"Python 压力测试器 v{APP_VERSION}（图形界面）"
 POLL_MS = 60                 # 主线程多久去队列里取一次新日志
 MAX_LOG_LINES = 4000         # 日志区最多留多少行，超出就从头删
 DRAIN_WAIT_SECONDS = 2.0     # 进程结束后，最多再等这么久把剩余输出收干净
@@ -224,8 +225,10 @@ class StressApp:
         self.stats_text = ""
         self.ref_note = ""                          # 「参考程序自身出错 …」那一句
         self.last_counts = (0, 0, 0, 0)             # 通过 / 崩 / 超时 / 不一致
-        self.last_opened_path: Path | None = None   # 防重复打开，见 open_selected_fail
-        self.last_opened_at = 0.0
+        # 失败用例的预览窗：全局只有一个，见 open_preview
+        self.preview_window: tk.Toplevel | None = None
+        self.preview_text: ScrolledText | None = None
+        self.preview_path: Path | None = None
 
         self.main_py, self.gen_py, self.workdir = resolve_working_files()
         self.outdir = resolve_outdir(self.workdir)
@@ -332,6 +335,9 @@ class StressApp:
         ttk.Button(bar, text="清空日志", command=self.clear_log).grid(row=0, column=2, padx=(8, 0))
         ttk.Label(bar, textvariable=self.status_var, foreground="#00429d").grid(
             row=0, column=3, sticky="e")
+        # 版本号：放在这一行最右边，不碍事
+        ttk.Label(bar, text=f"v{APP_VERSION}", foreground="#888888").grid(
+            row=0, column=4, sticky="e", padx=(12, 0))
 
     def _build_stats(self, parent: ttk.Frame, row: int) -> None:
         self.stats_label = tk.Label(
@@ -390,7 +396,7 @@ class StressApp:
         paned.add(right, weight=4)
 
     def _build_fail_list(self, parent: ttk.Frame, row: int) -> None:
-        box = ttk.LabelFrame(parent, text=" 失败用例（点一下在文件夹里定位到它） ", padding=8)
+        box = ttk.LabelFrame(parent, text=" 失败用例（点一下在这里直接看内容） ", padding=8)
         box.grid(row=row, column=0, sticky="ew", pady=(8, 0))
         box.columnconfigure(0, weight=1)
 
@@ -452,6 +458,7 @@ class StressApp:
 
     def _print_environment(self) -> None:
         self.append_log("=" * 76, "dim")
+        self.append_log(f"Python 压力测试器 v{APP_VERSION}（图形界面）", "dim")
         self.append_log(f"main.py  ：{self.main_py}", "dim")
         self.append_log(f"gen.py   ：{self.gen_py}", "dim")
         self.append_log(f"解释器   ：{self.python_var.get()}", "dim")
@@ -526,8 +533,8 @@ class StressApp:
         if path:
             self.python_var.set(path)
 
-    def open_path(self, path: Path) -> None:
-        """在文件管理器里打开它所在的文件夹并选中它。
+    def reveal_path(self, path: Path) -> None:
+        """在文件管理器里打开它所在的文件夹并选中它（预览窗里的「定位到文件夹」用）。
 
         耗时动作（explorer 冷启动可能几百毫秒）放后台线程，界面不卡。
         explorer 的返回码不可靠，所以只捕获"根本没启动起来"这种情况，
@@ -599,6 +606,7 @@ class StressApp:
             self.fail_list.insert("end", f"[{kind}] {path.name}    {size} 字节    {stamp}    {path}")
 
     def open_selected_fail(self, _event=None) -> str | None:
+        """单击列表里的某一项：在界面内弹个小窗预览它（不再去调资源管理器）。"""
         selection = self.fail_list.curselection()
         if not selection:
             return None
@@ -609,16 +617,142 @@ class StressApp:
         if path is None:
             return None
 
-        # 双击会被系统当成「两次单击」，只靠去掉双绑还不够，这里再兜一道：
-        # 同一个文件 1.5 秒内只打开一次，绝不会重复弹两个窗口。
-        now = time.time()
-        if path == self.last_opened_path and now - self.last_opened_at < 1.5:
-            return "break"
-        self.last_opened_path = path
-        self.last_opened_at = now
-
-        self.open_path(path)
+        self.open_preview(path)
         return "break"
+
+    # ------------------------------------------------------------------ #
+    # 失败用例预览窗（全局只有一个，不阻塞主界面）
+    # ------------------------------------------------------------------ #
+    def open_preview(self, path: Path) -> None:
+        """把文件内容显示在一个小窗里。
+
+        * 全局只留一个预览窗：已经开着就复用，同一个文件只提到最前面，不重复读；
+        * 主界面不受影响：Toplevel 不是模态窗口，该跑测试照样能跑；
+        * 读不到文件也不静默失败，在小窗里显示一句人话。
+        """
+        window = self.preview_window
+        already_open = window is not None and window.winfo_exists()
+
+        # 同一个文件再点一次（比如双击）：只把它提到最前面，别的什么都不做
+        if already_open and self.preview_path == path:
+            self._raise_preview(window)
+            return
+
+        if not already_open:
+            window = self._create_preview_window()
+
+        content, problem = self._read_for_preview(path)
+        text = self.preview_text
+        text.configure(state="normal")
+        text.delete("1.0", "end")
+        text.insert("1.0", content if problem is None else problem)
+        text.configure(state="disabled")
+        text.see("1.0")
+
+        window.title(path.name)                 # 标题就是文件名，例如 fail_1.txt
+        self.preview_path = path
+        self._raise_preview(window)
+        self.append_log(f"已打开 {path.name}", "dim")
+
+    @staticmethod
+    def _read_for_preview(path: Path):
+        """返回 (文件内容, 出错时的友好提示)。读不到绝不抛异常。"""
+        try:
+            return path.read_text(encoding="utf-8", errors="replace"), None
+        except OSError:
+            return "", ("（读不到这个文件：可能被安全软件拦住了，或者它已经被删掉/改名了）\n\n"
+                        "文件位置：\n{}".format(path))
+
+    def _create_preview_window(self) -> tk.Toplevel:
+        window = tk.Toplevel(self.root)
+        window.title("预览")
+        window.geometry("780x560")
+        window.minsize(420, 300)
+        window.transient(self.root)             # 跟着主窗口，不会被压到后面去
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+
+        text = ScrolledText(window, wrap="none", font=MONO_FONT,
+                            state="disabled", background="#fbfbfb")
+        text.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 6))
+        # 只读（state=disabled）不影响鼠标选中和复制；再显式绑一次 Ctrl+C 做双保险。
+        text.bind("<Control-c>", self._copy_selection)
+        text.bind("<Control-C>", self._copy_selection)
+
+        buttons = ttk.Frame(window)
+        buttons.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+        ttk.Button(buttons, text="复制全部内容", command=self._copy_all).grid(row=0, column=0)
+        ttk.Button(buttons, text="定位到文件夹",
+                   command=self._reveal_current_preview).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(buttons, text="关闭", command=self._close_preview).grid(row=0, column=2, padx=(8, 0))
+        ttk.Label(buttons, text="可以拖动选中，Ctrl+C 复制", foreground="#666666").grid(
+            row=0, column=3, sticky="e", padx=(12, 0))
+        buttons.columnconfigure(3, weight=1)
+
+        window.protocol("WM_DELETE_WINDOW", self._close_preview)
+        self.preview_window = window
+        self.preview_text = text
+        return window
+
+    def _raise_preview(self, window: tk.Toplevel) -> None:
+        """把预览窗提到最前面（Windows 上光 lift() 经常不够，短暂置顶一下）。"""
+        try:
+            window.deiconify()
+            window.lift()
+            window.attributes("-topmost", True)
+            window.after(500, lambda: self._drop_topmost(window))
+            window.focus_set()
+        except tk.TclError:
+            pass
+
+    @staticmethod
+    def _drop_topmost(window: tk.Toplevel) -> None:
+        try:
+            if window.winfo_exists():
+                window.attributes("-topmost", False)
+        except tk.TclError:
+            pass
+
+    def _copy_selection(self, event=None):
+        """Ctrl+C：有选中就复制选中的，没选中就复制全文。"""
+        widget = getattr(event, "widget", None) or self.preview_text
+        if widget is None:
+            return "break"
+        try:
+            selected = widget.get("sel.first", "sel.last")
+        except tk.TclError:
+            selected = widget.get("1.0", "end-1c")
+        self._set_clipboard(selected)
+        return "break"
+
+    def _copy_all(self) -> None:
+        if self.preview_text is None:
+            return
+        self._set_clipboard(self.preview_text.get("1.0", "end-1c"))
+        name = self.preview_path.name if self.preview_path is not None else "文件"
+        self.append_log(f"已复制 {name} 的全部内容到剪贴板", "dim")
+
+    def _set_clipboard(self, content: str) -> None:
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(content)
+        except tk.TclError:
+            pass
+
+    def _reveal_current_preview(self) -> None:
+        if self.preview_path is not None:
+            self.reveal_path(self.preview_path)
+
+    def _close_preview(self) -> None:
+        window = self.preview_window
+        self.preview_window = None
+        self.preview_text = None
+        self.preview_path = None
+        if window is not None:
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
 
     # ------------------------------------------------------------------ #
     # 开始 / 停止

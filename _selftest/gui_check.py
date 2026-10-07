@@ -115,6 +115,10 @@ def run_checks():
           all(hasattr(application, n) for n in ("log_text", "gen_text", "fail_list", "stats_label")))
     check("界面：有「参考程序」输入框（对拍用）",
           hasattr(application, "ref_var") and application.ref_var.get() == "")
+    check("界面：窗口标题带版本号",
+          app_module.APP_VERSION == "0.1.0" and "v0.1.0" in root.title(), repr(root.title()))
+    check("界面：日志开头也写了版本号",
+          "v0.1.0" in application.log_text.get("1.0", "end"))
     check("界面：main.py 找对了", application.main_py.name == "main.py" and application.main_py.is_file(),
           str(application.main_py))
     check("界面：初始状态是空闲，停止按钮不可点",
@@ -198,23 +202,18 @@ def run_checks():
           application.fail_list.size() == len(listed),
           f"listbox={application.fail_list.size()} paths={len(listed)}")
 
-    # ---- 5. 点一下能打开（而且只打开一次） -------------------------------- #
+    # ---- 5. 点一下在界面内预览 -------------------------------------------- #
     check("失败用例：没有绑双击（双击=两次单击，会重复打开）",
           not application.fail_list.bind("<Double-Button-1>"),
           repr(application.fail_list.bind("<Double-Button-1>")))
 
     opened = []
-    application.open_path = lambda p: opened.append(p)
+    application.open_preview = lambda p: opened.append(p)
     application.fail_list.selection_clear(0, "end")
     application.fail_list.selection_set(0)
     application.open_selected_fail()
-    check("失败用例：点一下会调用系统默认程序打开它",
+    check("失败用例：点一下会去预览这个文件",
           len(opened) == 1 and opened[0] == listed[0], str(opened))
-
-    # 真实双击会被系统拆成两次单击事件，所以要保证第二次不会又打开一遍
-    application.open_selected_fail()
-    application.open_selected_fail()
-    check("失败用例：连点两次同一个文件只打开一次", len(opened) == 1, str(opened))
 
     # 没有失败文件时点占位行不应该出错
     application.current_fails = [None]
@@ -225,7 +224,98 @@ def run_checks():
     application.open_selected_fail()
     check("失败用例：没有文件时点占位行不会报错、也不会打开东西", not opened)
 
-    # 打开失败时给的提示必须是"人话"，并且带完整路径（打开动作在后台线程里做）
+    # ---- 5b. 预览窗本身（用真实的 open_preview） -------------------------- #
+    del application.open_preview                 # 去掉上面的临时替身，走真实实现
+    application.refresh_fail_list()
+
+    def preview_windows():
+        return [w for w in root.winfo_children() if isinstance(w, tk.Toplevel)]
+
+    application.fail_list.selection_clear(0, "end")
+    application.fail_list.selection_set(0)
+    application.open_selected_fail()
+    pump(root, 0.3)
+
+    windows = preview_windows()
+    first_path = listed[0]
+    check("预览窗：单击后弹出了一个 Toplevel 窗口", len(windows) == 1, str(len(windows)))
+    check("预览窗：标题就是文件名", windows and windows[0].title() == first_path.name,
+          repr(windows[0].title() if windows else ""))
+    shown = application.preview_text.get("1.0", "end-1c")
+    check("预览窗：内容和文件全文一致",
+          shown == first_path.read_text(encoding="utf-8", errors="replace"),
+          f"{len(shown)} 字符")
+    check("预览窗：日志里追加了「已打开」确认",
+          f"已打开 {first_path.name}" in application.log_text.get("1.0", "end"))
+    check("预览窗：内容区是只读的（disabled）",
+          str(application.preview_text["state"]) == "disabled")
+    check("预览窗：Ctrl+C 已经绑了复制处理",
+          bool(application.preview_text.bind("<Control-c>")))
+
+    # 连点同一个文件：不能越开越多，也不该重复读
+    win_before = windows[0]
+    for _ in range(3):
+        application.open_selected_fail()
+    pump(root, 0.2)
+    check("预览窗：连点同一个文件不会开出一堆窗口",
+          len(preview_windows()) == 1 and application.preview_window is win_before,
+          f"{len(preview_windows())} 个窗口")
+
+    # 点另一个文件：内容要跟着换，窗口还是同一个
+    if len(listed) >= 2:
+        application.fail_list.selection_clear(0, "end")
+        application.fail_list.selection_set(1)
+        application.open_selected_fail()
+        pump(root, 0.3)
+        second_path = listed[1]
+        check("预览窗：点另一个文件时内容和标题都换了",
+              application.preview_text.get("1.0", "end-1c")
+              == second_path.read_text(encoding="utf-8", errors="replace")
+              and application.preview_window.title() == second_path.name,
+              application.preview_window.title())
+        check("预览窗：换文件时复用的是同一个窗口",
+              application.preview_window is win_before and len(preview_windows()) == 1)
+
+    # 复制：选中一段按 Ctrl+C 的处理器，以及「复制全部内容」
+    body = application.preview_text.get("1.0", "end-1c")
+    application.preview_text.tag_add("sel", "1.0", "1.4")
+    application._copy_selection()
+    root.update()
+    check("预览窗：选中后复制的是选中的那一段",
+          root.clipboard_get() == body[:4], repr(root.clipboard_get()[:20]))
+    application.preview_text.tag_remove("sel", "1.0", "end")
+    application._copy_all()
+    root.update()
+    check("预览窗：「复制全部内容」把全文放进了剪贴板",
+          root.clipboard_get() == body, f"{len(root.clipboard_get())} 字符")
+    check("预览窗：全文里有「复现命令」那一行，方便直接粘贴",
+          "复现命令" in root.clipboard_get())
+
+    # 读不到文件时：小窗里给人话，不甩系统报错原文
+    ghost = OUT / "这个文件根本不存在_fail_9.txt"
+    application.open_preview(ghost)
+    pump(root, 0.3)
+    ghost_text = application.preview_text.get("1.0", "end-1c")
+    check("预览窗：读不到文件时给出人话提示、并带上完整路径",
+          "读不到这个文件" in ghost_text and str(ghost) in ghost_text
+          and "WinError" not in ghost_text and "Errno" not in ghost_text,
+          ghost_text.splitlines()[0] if ghost_text else "")
+
+    # 关掉小窗：主界面照常
+    application._close_preview()
+    pump(root, 0.3)
+    check("预览窗：关掉之后窗口真的没了",
+          not preview_windows() and application.preview_window is None)
+    application.fail_list.selection_clear(0, "end")
+    application.fail_list.selection_set(0)
+    application.open_selected_fail()             # 关掉之后还能再点开
+    pump(root, 0.3)
+    check("预览窗：关掉以后还能重新点开",
+          len(preview_windows()) == 1 and application.preview_window is not None,
+          f"窗口数={len(preview_windows())} 选中={application.fail_list.curselection()}")
+    application._close_preview()
+
+    # 「定位到文件夹」这个备选能力要留着
     def boom(_p):
         raise OSError("[WinError 5] 拒绝访问")
 
@@ -236,14 +326,14 @@ def run_checks():
     miss = ROOT / "_selftest" / "根本不存在_fail_1.txt"
     try:
         t0 = time.time()
-        app_module.StressApp.open_path(application, miss)     # 调真实的 open_path（后台线程）
+        app_module.StressApp.reveal_path(application, miss)   # 后台线程
         immediate = time.time() - t0
         pump(root, 5, until=lambda: bool(errs))               # 等后台线程把错误抛回主线程
     finally:
         app_module.reveal_in_folder = original_reveal
     text = " ".join(str(x) for x in errs[-1]) if errs else ""
-    check("打开失败：open_path 立刻返回，不等后台线程", immediate < 0.2, f"{immediate:.3f}s")
-    check("打开失败：提示是人话、带完整路径、不甩系统报错原文",
+    check("定位到文件夹：reveal_path 立刻返回，不等后台线程", immediate < 0.2, f"{immediate:.3f}s")
+    check("定位到文件夹：失败时的提示是人话、带完整路径、不甩系统报错原文",
           bool(errs) and "安全软件" in text and "记事本" in text
           and str(miss) in text and "WinError" not in text,
           text[:70])
@@ -352,13 +442,18 @@ def run_checks():
           any("[崩溃]" in k for k in kinds) and any("[答案不一致]" in k for k in kinds),
           str(kinds[:3]))
     diff_index = next((i for i, k in enumerate(kinds) if "[答案不一致]" in k), None)
-    opened.clear()
     if diff_index is not None:
         application.fail_list.selection_clear(0, "end")
         application.fail_list.selection_set(diff_index)
         application.open_selected_fail()
-    check("对拍：点 diff_*.txt 同样能打开它",
-          len(opened) == 1 and "diff_" in opened[0].name, str(opened))
+        pump(root, 0.3)
+    diff_name = application.preview_path.name if application.preview_path else ""
+    check("对拍：点 diff_*.txt 也能在预览窗里看到内容",
+          diff_name.startswith("diff_")
+          and "第一处不同" in application.preview_text.get("1.0", "end-1c")
+          and "复现命令" in application.preview_text.get("1.0", "end-1c"),
+          diff_name)
+    application._close_preview()
 
     # 参考程序自己崩了：统计条下面补一句，且绝不能写 fail_*/diff_*
     # 这里换一个「永远不崩」的被测试程序，才能干净地看出参考程序的错没算到它头上
