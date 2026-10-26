@@ -50,7 +50,9 @@ HEADER_KEYWORDS = {
     "gen_query": ["空输入", "负数", "最大规模", "l == r"],
 }
 
-COMMON_KEYWORDS = ["适用题型", "生成的输入格式", "要改哪几行", "改这里", "不要删", "数据规模"]
+# 头部统一格式（v0.3.0 起）：这五个小节 + 「改这里」「不要删」两个标记
+COMMON_KEYWORDS = ["适用题型", "这道题的输入长什么样", "一般只需要改这两行",
+                   "不要动的地方", "改这里", "不要删", "数据规模"]
 
 FORBIDDEN_IN_TEMPLATES = ["os.urandom", "time.time", "random.Random(", "import os",
                           "import time", "import uuid", "import secrets"]
@@ -217,8 +219,8 @@ def main():
 
         # ---- 头部四件事 + 规模常量 -------------------------------------- #
         missing = [k for k in COMMON_KEYWORDS if k not in source]
-        check(f"{name}：头部写了「适用题型/输入格式/要改哪几行/边界数据/数据规模」", not missing,
-              f"缺少 {missing}" if missing else "")
+        check(f"{name}：头部写了「适用题型/这道题的输入长什么样/一般只需要改这两行/不要动的地方/数据规模」",
+              not missing, f"缺少 {missing}" if missing else "")
         missing = [k for k in HEADER_KEYWORDS[name] if k not in source]
         check(f"{name}：头部点明了该有的雷", not missing, f"缺少 {missing}" if missing else "")
         const = SCALE_CONSTANT[name]

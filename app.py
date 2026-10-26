@@ -32,11 +32,12 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 APP_TITLE = f"Python 压力测试器 v{APP_VERSION}（图形界面）"
 POLL_MS = 60                 # 主线程多久去队列里取一次新日志
 MAX_LOG_LINES = 4000         # 日志区最多留多少行，超出就从头删
 DRAIN_WAIT_SECONDS = 2.0     # 进程结束后，最多再等这么久把剩余输出收干净
+TAB_WIDTH = 4                # 编辑区按 Tab 插入几个空格（templates/ 里的模板都是空格缩进）
 
 # 「套用模板」下拉框里的固定项
 NO_TEMPLATE = "（不使用模板）"
@@ -209,6 +210,19 @@ def reveal_in_folder(path: Path) -> None:
         subprocess.Popen(["open", str(folder)])
     else:
         subprocess.Popen(["xdg-open", str(folder)])
+
+
+def normalize_tabs(text: str) -> tuple[str, int]:
+    """把内容里的 Tab 统一换成 4 个空格。
+
+    返回 (换好以后的内容, 一共换掉了几个 Tab)。
+    编辑区里按 Tab 已经是插空格了，但用户可能是从别处粘贴进来的，
+    那种 Tab 键管不到，所以写盘前再兜一道，免得 main.py 那边报 TabError。
+    """
+    tab_count = text.count("\t")
+    if tab_count == 0:
+        return text, 0
+    return text.replace("\t", " " * TAB_WIDTH), tab_count
 
 
 # --------------------------------------------------------------------------- #
@@ -401,6 +415,10 @@ class StressApp:
         gen_xscroll.grid(row=1, column=0, sticky="ew")
         self.gen_text.configure(yscrollcommand=gen_scroll.set, xscrollcommand=gen_xscroll.set)
         self.gen_text.bind("<<Modified>>", self._on_gen_modified)
+        # Tab 键插 4 个空格（不是 \t），免得和模板的空格缩进混用报 TabError
+        self.gen_text.bind("<Tab>", self._on_editor_tab)
+        # Shift+Tab 往左缩：必须显式绑，否则 Tk 会退到通用的 <Tab> 上又插一次空格
+        self.gen_text.bind("<Shift-Tab>", self._on_editor_shift_tab)
 
         # 右：实时日志
         right = ttk.LabelFrame(paned, text=" 实时日志 ", padding=8)
@@ -516,6 +534,8 @@ class StressApp:
 
     def save_gen(self) -> bool:
         content = self.gen_text.get("1.0", "end-1c")
+        # 粘贴进来的 Tab 也统一换成空格，写盘的就是干净的空格缩进
+        content, replaced_tabs = normalize_tabs(content)
         try:
             self.gen_py.write_text(content, encoding="utf-8")
         except OSError as exc:
@@ -525,7 +545,107 @@ class StressApp:
         self.gen_state_var.set(f"已保存 {time.strftime('%H:%M:%S')}")
         if self.log_line_count:
             self.append_log(f"（已保存 gen.py：{self.gen_py}）", "dim")
+        if replaced_tabs:
+            self.append_log(
+                f"（内容里有 {replaced_tabs} 个 Tab，已换成 {TAB_WIDTH} 个空格再保存）",
+                "dim")
         return True
+
+    def _on_editor_tab(self, _event=None) -> str:
+        """Tab 键：插入 4 个空格；选中了多行就整体往右缩进 4 个空格。
+
+        模板里用的是空格缩进，这里要是插真的 \\t 就会出现
+        TabError: inconsistent use of tabs and spaces in indentation，
+        用户根本看不懂，所以干脆永远只插空格。
+        """
+        has_selection = bool(self.gen_text.tag_ranges("sel"))
+        if not has_selection:
+            self.gen_text.insert("insert", " " * TAB_WIDTH)
+            return "break"
+
+        first_line, last_line = self._selected_line_range()
+        self._indent_lines(first_line, last_line)
+        return "break"
+
+    def _on_editor_shift_tab(self, _event=None) -> str:
+        """Shift+Tab：往左缩进（每行删掉最多 4 个行首空格）。
+
+        没选中时只动光标所在的那一行；选中多行时这几行一起往左缩。
+        """
+        has_selection = bool(self.gen_text.tag_ranges("sel"))
+        if not has_selection:
+            cursor_line = int(self.gen_text.index("insert").split(".")[0])
+            self._dedent_line(cursor_line)
+            return "break"
+
+        first_line, last_line = self._selected_line_range()
+        self._dedent_lines(first_line, last_line)
+        return "break"
+
+    def _selected_line_range(self) -> tuple[int, int]:
+        """选区覆盖了哪几行（行号从 1 数）。
+
+        选区正好停在一行的行首时，最后那一行其实没选中，要减掉。
+        """
+        first_index = self.gen_text.index("sel.first")
+        last_index = self.gen_text.index("sel.last")
+        first_line = int(first_index.split(".")[0])
+        last_line = int(last_index.split(".")[0])
+        last_column = int(last_index.split(".")[1])
+        if last_column == 0 and last_line > first_line:
+            last_line = last_line - 1
+        return first_line, last_line
+
+    def _indent_lines(self, first_line: int, last_line: int) -> None:
+        """给这几行的行首各加 4 个空格，然后重新选中这几行。"""
+        for line_number in range(first_line, last_line + 1):
+            line_start = f"{line_number}.0"
+            self.gen_text.insert(line_start, " " * TAB_WIDTH)
+        self._select_lines(first_line, last_line)
+
+    def _dedent_lines(self, first_line: int, last_line: int) -> None:
+        """给这几行各删掉最多 4 个行首空格，然后重新选中这几行。"""
+        for line_number in range(first_line, last_line + 1):
+            self._dedent_line(line_number)
+        self._select_lines(first_line, last_line)
+
+    def _dedent_line(self, line_number: int) -> None:
+        """删掉这一行行首最多 4 个空格（不足 4 个就删光）。"""
+        line_text = self.gen_text.get(f"{line_number}.0", f"{line_number}.end")
+        leading_spaces = 0
+        for char in line_text:
+            if char != " ":
+                break
+            leading_spaces = leading_spaces + 1
+
+        remove_count = min(leading_spaces, TAB_WIDTH)
+        if remove_count == 0:
+            return
+
+        self.gen_text.delete(f"{line_number}.0", f"{line_number}.{remove_count}")
+
+    def _select_lines(self, first_line: int, last_line: int) -> None:
+        """把这几行整块重新选中：这样连按 Tab / Shift+Tab 能一直缩下去。"""
+        self.gen_text.tag_remove("sel", "1.0", "end")
+        self.gen_text.tag_add("sel", f"{first_line}.0", f"{last_line}.end")
+
+    def _fix_tabs_on_disk(self) -> int:
+        """运行前兜底：gen.py 里要是还有 Tab，换成 4 个空格再交给 main.py。"""
+        try:
+            disk_text = self.gen_py.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return 0
+        fixed_text, replaced_tabs = normalize_tabs(disk_text)
+        if replaced_tabs == 0:
+            return 0
+        try:
+            self.gen_py.write_text(fixed_text, encoding="utf-8")
+        except OSError:
+            return 0
+        self.append_log(
+            f"（gen.py 里有 {replaced_tabs} 个 Tab，已换成 {TAB_WIDTH} 个空格再运行）",
+            "dim")
+        return replaced_tabs
 
     # ------------------------------------------------------------------ #
     # 一键套用 templates/ 里的模板
@@ -926,10 +1046,20 @@ class StressApp:
             return
         target_path, python_exe, count, timeout, seed, ref_path = form
 
+        # 新的一轮开始了，先把上一轮留下的统计清掉，
+        # 免得这一轮启动失败时，横条还挂着上一轮的结果
+        self.stats_text = ""
+
         # 左边编辑器里有改动就先存盘，保证跑的是界面上看到的那份规则
         if self.gen_dirty or not self.gen_py.is_file():
             if not self.save_gen():
+                # 存盘失败也是一轮"报错退出"，状态要跟着复位，别把界面卡在半路
+                self._finish_run("出错了：保存 gen.py 失败（看日志）", failed=True)
                 return
+
+        # 保险：从别处粘贴进来的 Tab 也统一换成 4 个空格，
+        # 否则 main.py 那边会报 TabError（用户看不懂），这一步在运行前兜底
+        self._fix_tabs_on_disk()
 
         cmd = [
             python_exe, str(self.main_py), str(target_path),
@@ -971,6 +1101,8 @@ class StressApp:
             )
         except OSError as exc:
             self.append_log(f"错误：启动不了 main.py：{exc}", "error")
+            # 报错退出也要走统一的收尾，否则按钮还是灰的、状态还停在上一句
+            self._finish_run("出错了：启动不了 main.py（看日志）", failed=True)
             messagebox.showerror("启动失败", f"启动不了 main.py：\n{exc}")
             return
 
@@ -983,10 +1115,22 @@ class StressApp:
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
 
-        self.reader_thread = threading.Thread(target=self._read_output, args=(self.proc,), daemon=True)
-        self.reader_thread.start()
-        self.waiter_thread = threading.Thread(target=self._wait_process, args=(self.proc,), daemon=True)
-        self.waiter_thread.start()
+        try:
+            self.reader_thread = threading.Thread(target=self._read_output, args=(self.proc,), daemon=True)
+            self.reader_thread.start()
+            self.waiter_thread = threading.Thread(target=self._wait_process, args=(self.proc,), daemon=True)
+            self.waiter_thread.start()
+        except Exception as exc:
+            # 线程起不来（极少见，比如系统线程耗尽）：没有等待线程就不会有"退出"事件，
+            # 界面会永远停在"正在跑…"，所以这里必须自己收尾。
+            self.append_log(f"错误：起不了后台线程：{exc}", "error")
+            proc = self.proc
+            if proc is not None:
+                try:
+                    threading.Thread(target=self.kill_tree, args=(proc,), daemon=True).start()
+                except Exception:
+                    pass          # 连杀进程的线程都起不来，那就交给它自己跑完
+            self._finish_run("出错了：起不了后台线程（看日志）", failed=True)
 
     def stop(self) -> None:
         if not self.running or self.proc is None:
@@ -998,7 +1142,11 @@ class StressApp:
         # 杀进程要调 taskkill（最多等 10 秒），放到后台线程去做，
         # 主线程立刻返回，界面在这期间照样能刷新、能点。
         proc = self.proc
-        threading.Thread(target=self.kill_tree, args=(proc,), daemon=True).start()
+        try:
+            threading.Thread(target=self.kill_tree, args=(proc,), daemon=True).start()
+        except Exception:
+            # 线程起不来就只好在本线程里杀：会卡一下，但总比停不下来强
+            self.kill_tree(proc)
 
     @staticmethod
     def kill_tree(proc: subprocess.Popen) -> None:
@@ -1040,7 +1188,12 @@ class StressApp:
                 pass
 
     def _wait_process(self, proc: subprocess.Popen) -> None:
-        code = proc.wait()
+        try:
+            code = proc.wait()
+        except Exception:
+            # 拿不到返回码也要把"结束"事件送出去，
+            # 否则界面会一直停在"正在跑…"，再也点不动开始
+            code = None
         # 给读取线程一点时间把最后几行吐完（正常情况瞬间就好）
         if self.reader_thread is not None:
             self.reader_thread.join(timeout=DRAIN_WAIT_SECONDS)
@@ -1093,28 +1246,48 @@ class StressApp:
         if progress:
             self.status_var.set(f"正在运行：第 {progress.group(1)} / {progress.group(2)} 组")
 
-    def _handle_exit(self, code) -> None:
-        self.running = False
-        self.start_btn.configure(state="normal")
-        self.stop_btn.configure(state="disabled")
-        self.proc = None
-
+    def _exit_status_text(self, code) -> str:
+        """按这一轮结束的方式，挑一句状态栏文字（不含复位动作）。"""
         if self.stop_requested:
-            self.status_var.set("已停止")
-            if not self.stats_text:
-                self.set_stats("已停止（没跑完）", "#eeeeee", "#555555")
-        elif code == 0:
-            self.status_var.set("完成：全部通过")
-        elif code == 1:
+            return "已停止"
+        if code == 0:
+            return "完成：全部通过"
+        if code == 1:
             passed, crashed, timed_out, mismatch = self.last_counts
             if crashed or timed_out or mismatch:
-                self.status_var.set("完成：发现了问题，看下面的失败用例")
+                return "完成：发现了问题，看下面的失败用例"
+            return "完成：参考程序自身出错，请先修参考程序"
+        if code == 2:
+            return "出错了：用法或环境问题（看日志里的「错误：」）"
+        if code is None:
+            return "出错了：拿不到 main.py 的退出码（看日志）"
+        return f"结束（返回码 {code}）"
+
+    def _finish_run(self, status_text: str, failed: bool = False) -> None:
+        """一轮测试的收尾动作：正常跑完、用户点停止、中途报错，三条路最后都走这里。
+
+        做完保证界面回到"随时能再点开始"的状态，不会停在"看起来还在跑"。
+        """
+        self.running = False
+        self.proc = None
+        self.stop_requested = False
+        self.start_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self.status_var.set(status_text)
+        if not self.stats_text:
+            # 没拿到统计行（启动失败 / 中途出错 / 停得太早）：别让横条停在「正在跑…」
+            if failed:
+                self.set_stats("这一轮没跑起来（看日志）", "#fdecec", "#b00000")
             else:
-                self.status_var.set("完成：参考程序自身出错，请先修参考程序")
-        elif code == 2:
-            self.status_var.set("出错了：用法或环境问题（看日志里的「错误：」）")
-        else:
-            self.status_var.set(f"结束（返回码 {code}）")
+                self.set_stats(status_text, "#eeeeee", "#555555")
+
+    def _handle_exit(self, code) -> None:
+        stopped = self.stop_requested
+        status_text = self._exit_status_text(code)
+        self._finish_run(status_text, failed=(code == 2 or code is None))
+
+        if stopped and not self.stats_text:
+            self.set_stats("已停止（没跑完）", "#eeeeee", "#555555")
 
         self.append_log("", None)
         self.append_log(f"（main.py 已退出，返回码 {code}）", "dim")

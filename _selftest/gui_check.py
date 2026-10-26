@@ -116,7 +116,7 @@ def run_checks():
     check("界面：有「参考程序」输入框（对拍用）",
           hasattr(application, "ref_var") and application.ref_var.get() == "")
     check("界面：窗口标题带版本号",
-          app_module.APP_VERSION == "0.2.0"
+          app_module.APP_VERSION == "0.3.0"
           and f"v{app_module.APP_VERSION}" in root.title(), repr(root.title()))
     check("界面：日志开头也写了版本号",
           f"v{app_module.APP_VERSION}" in application.log_text.get("1.0", "end"))
@@ -486,17 +486,18 @@ def run_checks():
     check("模板：第一项固定是「（不使用模板）」",
           bool(values) and values[0] == "（不使用模板）", str(values[:2]))
     template_names = [v for v in values if v.endswith(".py")]
-    check("模板：列出了 templates/ 下这一层的 6 个 gen_*.py（不含 examples/）",
-          template_names == ["gen_array.py", "gen_graph.py", "gen_matrix.py",
-                             "gen_multi.py", "gen_query.py", "gen_string.py"],
-          str(template_names))
+    expected_names = sorted(p.name for p in (ROOT / "templates").glob("gen_*.py"))
+    check("模板：列出了 templates/ 下这一层的所有 gen_*.py（不含 examples/）",
+          template_names == expected_names
+          and not any("_target" in name for name in template_names),
+          f"{len(template_names)} 个：{template_names}")
     check("模板：找到了 templates 目录并绑好了选择事件",
-          application.templates_dir is not None and len(application.template_paths) == 6
+          application.templates_dir is not None
+          and len(application.template_paths) == len(expected_names)
           and bool(box.bind("<<ComboboxSelected>>")),
-          str(application.templates_dir))
+          f"{str(application.templates_dir)} / {len(application.template_paths)} 个")
 
     disk_before_bytes = application.gen_py.read_bytes()
-    disk_before = disk_before_bytes.decode("utf-8")
     application.load_gen()                      # 从磁盘重新载入，保证起点干净
 
     application.template_var.set("gen_array.py")
@@ -507,7 +508,7 @@ def run_checks():
           f"{len(array_text)} 字符")
     check("模板：套用后标成「还没保存」，但没写盘",
           application.gen_dirty is True and "还没保存" in application.gen_state_var.get()
-          and application.gen_py.read_text(encoding="utf-8") == disk_before,
+          and application.gen_py.read_bytes() == disk_before_bytes,
           application.gen_state_var.get())
 
     # 编辑区有未保存的改动时，再选另一个模板要先弹确认框
@@ -578,7 +579,249 @@ def run_checks():
           and stranded.template_var.get() == app_module.NO_TEMPLATES_DIR,
           f"{list(stranded.template_box['values'])} / state={stranded.template_box['state']}")
 
-    # ---- 10. 关窗 ---------------------------------------------------------- #
+    # ---- 10. 编辑区的 Tab / Shift+Tab 缩进 --------------------------------- #
+    editor = application.gen_text
+    check("Tab：编辑区绑了 Tab 键", bool(editor.bind("<Tab>")))
+    check("Shift+Tab：编辑区也绑了 Shift+Tab 键（不会退到 <Tab> 上）",
+          bool(editor.bind("<Shift-Tab>")))
+    check("Tab：没有抢占 Ctrl+Z / Ctrl+A",
+          not editor.bind("<Control-z>")
+          and not editor.bind("<Control-a>"),
+          f"Ctrl-Z={editor.bind('<Control-z>')!r} Ctrl-A={editor.bind('<Control-a>')!r}")
+
+    # 没选中：光标处插 4 个空格
+    editor.delete("1.0", "end")
+    editor.insert("1.0", "def gen():\n    return '1'\n")
+    editor.mark_set("insert", "2.4")
+    application._on_editor_tab()
+    line_two = editor.get("2.0", "2.end")
+    check("Tab：没选中时在光标处插入 4 个空格", line_two == "        return '1'", repr(line_two))
+    check("Tab：插进去的不是真正的 Tab 字符", "\t" not in editor.get("1.0", "end-1c"))
+
+    # 选中两行：整体往右缩进 4 个空格
+    editor.tag_remove("sel", "1.0", "end")
+    editor.tag_add("sel", "1.0", "2.end")
+    application._on_editor_tab()
+    check("Tab：选中多行时每行都往右缩进 4 个空格",
+          editor.get("1.0", "1.end") == "    def gen():"
+          and editor.get("2.0", "2.end") == "            return '1'",
+          f"{editor.get('1.0', '1.end')!r} / {editor.get('2.0', '2.end')!r}")
+    check("Tab：缩进之后这几行仍然是选中的（可以连按 Tab）",
+          bool(editor.tag_ranges("sel")))
+
+    # 选区正好停在下一行行首：那一行不算选中，不能缩进
+    editor.delete("1.0", "end")
+    editor.insert("1.0", "a\nb\n")
+    editor.tag_remove("sel", "1.0", "end")
+    editor.tag_add("sel", "1.0", "2.0")
+    application._on_editor_tab()
+    check("Tab：选区停在下一行行首时，只缩进真正选中的那一行",
+          editor.get("1.0", "1.end") == "    a" and editor.get("2.0", "2.end") == "b",
+          f"{editor.get('1.0', '1.end')!r} / {editor.get('2.0', '2.end')!r}")
+
+    # 插进去的空格可以被撤销（Ctrl+Z 走的还是 Tk 自带的 undo）
+    editor.delete("1.0", "end")
+    editor.insert("1.0", "x")
+    editor.edit_reset()                          # 清掉撤销栈，让 Tab 的插入单独成块
+    editor.mark_set("insert", "1.1")
+    application._on_editor_tab()
+    after_tab = editor.get("1.0", "1.end")
+    editor.edit_undo()
+    check("Tab：插进去的空格能用撤销回退（Ctrl+Z 仍然有效）",
+          after_tab == "x    " and editor.get("1.0", "1.end") == "x",
+          f"按 Tab 后={after_tab!r} 撤销后={editor.get('1.0', '1.end')!r}")
+
+    # ---- Shift+Tab 往左缩（直接调处理器，确定性地测行为） ------------------ #
+    editor.delete("1.0", "end")
+    editor.insert("1.0", "    x\n")
+    editor.tag_remove("sel", "1.0", "end")
+    editor.mark_set("insert", "1.3")
+    application._on_editor_shift_tab()
+    check("Shift+Tab：没选中时行首 4 个空格被删掉",
+          editor.get("1.0", "1.end") == "x", repr(editor.get("1.0", "1.end")))
+
+    editor.delete("1.0", "end")
+    editor.insert("1.0", "  x\n")            # 只有 2 个空格
+    editor.mark_set("insert", "1.3")
+    application._on_editor_shift_tab()
+    check("Shift+Tab：行首不足 4 个空格时就删光",
+          editor.get("1.0", "1.end") == "x", repr(editor.get("1.0", "1.end")))
+
+    editor.delete("1.0", "end")
+    editor.insert("1.0", "x\n")              # 一个空格都没有
+    editor.mark_set("insert", "1.1")
+    application._on_editor_shift_tab()
+    check("Shift+Tab：行首没空格时什么都不动（不越界）",
+          editor.get("1.0", "1.end") == "x", repr(editor.get("1.0", "1.end")))
+
+    editor.delete("1.0", "end")
+    editor.insert("1.0", "        a\n  b\nc\n")     # 行首分别是 8 / 2 / 0 个空格
+    editor.tag_remove("sel", "1.0", "end")
+    editor.tag_add("sel", "1.0", "3.end")
+    application._on_editor_shift_tab()
+    check("Shift+Tab：选中多行时每行各删掉最多 4 个行首空格",
+          editor.get("1.0", "1.end") == "    a"
+          and editor.get("2.0", "2.end") == "b"
+          and editor.get("3.0", "3.end") == "c",
+          f"{editor.get('1.0', '1.end')!r} / {editor.get('2.0', '2.end')!r} / "
+          f"{editor.get('3.0', '3.end')!r}")
+    check("Shift+Tab：往左缩之后这几行仍然是选中的（可以连按）",
+          bool(editor.tag_ranges("sel")))
+
+    # 往返一次：Tab 再 Shift+Tab 应该回到原样
+    editor.delete("1.0", "end")
+    editor.insert("1.0", "a\nb\n")
+    editor.tag_remove("sel", "1.0", "end")
+    editor.tag_add("sel", "1.0", "2.end")
+    application._on_editor_tab()
+    application._on_editor_shift_tab()
+    check("Tab 往返：Tab 再 Shift+Tab 能回到原样",
+          editor.get("1.0", "1.end") == "a" and editor.get("2.0", "2.end") == "b",
+          f"{editor.get('1.0', '1.end')!r} / {editor.get('2.0', '2.end')!r}")
+
+    # 真实按键：隐藏窗口收不到键盘事件，先把窗口显示出来再按
+    root.deiconify()
+    root.update()
+    editor.focus_force()
+    root.update()
+    editor.delete("1.0", "end")
+    editor.insert("1.0", "x")
+    editor.mark_set("insert", "1.1")
+    editor.event_generate("<Tab>", when="now")
+    root.update()
+    keyboard_events_work = editor.get("1.0", "1.end") == "x    "
+
+    if keyboard_events_work:
+        editor.delete("1.0", "end")
+        editor.insert("1.0", "    x")
+        editor.mark_set("insert", "1.3")
+        editor.event_generate("<Shift-Tab>", when="now")
+        root.update()
+        check("Shift+Tab：真按 Shift+Tab 是往左缩，不会再插 4 个空格",
+              editor.get("1.0", "1.end") == "x", repr(editor.get("1.0", "1.end")))
+
+        editor.mark_set("insert", "1.1")
+        editor.event_generate("<Tab>", when="now")
+        root.update()
+        check("Tab：真按 Tab 仍然插 4 个空格（没被 Shift+Tab 影响）",
+              editor.get("1.0", "1.end") == "x    ", repr(editor.get("1.0", "1.end")))
+    else:
+        skip("Shift+Tab：真按 Shift+Tab 是往左缩", "这个环境派发不了键盘事件")
+
+    root.withdraw()
+    root.update()
+
+    # 粘贴进来的 Tab：保存时换成 4 个空格
+    tabs_backup = application.gen_py.read_bytes()
+    editor.delete("1.0", "end")
+    editor.insert("1.0", "def gen():\n\treturn '1'\t# 带 Tab\n")
+    application.gen_dirty = True
+    saved_ok = application.save_gen()
+    disk_text = application.gen_py.read_text(encoding="utf-8")
+    check("Tab：保存时把粘贴进来的 Tab 换成 4 个空格",
+          saved_ok and "\t" not in disk_text and "    return '1'    # 带 Tab" in disk_text,
+          repr(disk_text))
+
+    # 运行前兜底：磁盘上残留的 Tab 也要换掉
+    application.gen_py.write_text("def gen():\n\treturn '1'\n", encoding="utf-8")
+    fixed_tabs = application._fix_tabs_on_disk()
+    check("Tab：运行前兜底会把 gen.py 里残留的 Tab 换掉",
+          fixed_tabs == 1 and "\t" not in application.gen_py.read_text(encoding="utf-8"),
+          f"换了 {fixed_tabs} 个")
+
+    # ---- 11. 报错退出之后的界面复位 ---------------------------------------- #
+    application.gen_py.write_bytes(tabs_backup)
+    application.load_gen()
+    application.ref_var.set("")
+    application.count_var.set("3")
+    application.seed_var.set("123")
+
+    # (1) 启动就失败：解释器路径根本不存在 -> Popen 抛 OSError
+    application.target_var.set(str(target))
+    application.python_var.set(str(ROOT / "根本没有这个解释器.exe"))
+    warnings.clear()
+    application.start()
+    pump(root, 3.0)
+    check("复位：启动失败（解释器不存在）时状态是「出错了」",
+          "出错了" in application.status_var.get(), repr(application.status_var.get()))
+    check("复位：启动失败后按钮已复位、能立刻再点开始",
+          application.running is False and application.proc is None
+          and str(application.start_btn["state"]) == "normal"
+          and str(application.stop_btn["state"]) == "disabled")
+    check("复位：启动失败后横条不再停在「正在跑…」",
+          "正在跑" not in application.stats_label["text"],
+          repr(application.stats_label["text"]))
+
+    # (2) 跑起来了但 main.py 报错退出（返回码 2）：gen.py 里没有 gen()
+    application.python_var.set(app_module.find_python_interpreter())
+    out_err = OUT / "err_exit"
+    if out_err.exists():
+        shutil.rmtree(out_err)
+    out_err.mkdir(parents=True)
+    application.outdir = out_err
+    application.outdir_var.set(str(out_err))
+    application.gen_py.write_text("def not_gen():\n    return '1'\n", encoding="utf-8")
+    application.start()
+    pump(root, 60, until=lambda: application.running is False)
+    pump(root, 0.5)
+    check("复位：main.py 返回码 2 时状态是「出错了」",
+          "出错了" in application.status_var.get(), repr(application.status_var.get()))
+    check("复位：报错退出后按钮已复位、能立刻再点开始",
+          application.running is False and application.proc is None
+          and str(application.start_btn["state"]) == "normal"
+          and str(application.stop_btn["state"]) == "disabled")
+
+    # (3) 保存 gen.py 失败（写盘报错）也要复位
+    blocked_target = WORK / "写不进去的gen"
+    blocked_target.mkdir(exist_ok=True)          # 让它是个目录，写文件必然失败
+    application.gen_py = blocked_target
+    application.gen_dirty = True
+    warnings.clear()
+    application.start()
+    pump(root, 2.0)
+    check("复位：保存 gen.py 失败时状态是「出错了」",
+          "出错了" in application.status_var.get(), repr(application.status_var.get()))
+    check("复位：保存失败后按钮也复位了", application.running is False
+          and str(application.start_btn["state"]) == "normal"
+          and str(application.stop_btn["state"]) == "disabled")
+    application.gen_py = ROOT / "gen.py"
+
+    # (4) 后台线程起不来（极端情况）也不能把界面卡在「正在跑…」
+    real_thread_class = app_module.threading.Thread
+
+    def broken_thread(*args, **kwargs):
+        raise RuntimeError("can't start new thread")
+
+    application.target_var.set(str(target))
+    application.gen_dirty = False
+    application.load_gen()
+    app_module.threading.Thread = broken_thread
+    try:
+        application.start()
+    finally:
+        app_module.threading.Thread = real_thread_class
+    pump(root, 2.0)
+    check("复位：后台线程起不来时状态是「出错了」、按钮也复位了",
+          "出错了" in application.status_var.get()
+          and application.running is False
+          and str(application.start_btn["state"]) == "normal"
+          and str(application.stop_btn["state"]) == "disabled",
+          repr(application.status_var.get()))
+
+    # (5) 报错退出之后直接再点「开始」，必须能正常跑完
+    application.gen_py.write_bytes(tabs_backup)
+    application.load_gen()
+    application.target_var.set(str(ROOT / "templates" / "examples" / "gen_array_target.py"))
+    application.start()
+    pump(root, 60, until=lambda: application.running is False)
+    pump(root, 0.5)
+    check("复位：报错退出之后再点「开始」能正常跑完",
+          application.stats_label["text"] == "通过 3 组 / 崩 0 组 / 超时 0 组",
+          repr(application.stats_label["text"]))
+    check("复位：正常跑完的状态是「完成：全部通过」",
+          application.status_var.get() == "完成：全部通过", repr(application.status_var.get()))
+
+    # ---- 12. 关窗 ---------------------------------------------------------- #
     application.on_close()
     check("关窗：窗口正常销毁", True)
 
